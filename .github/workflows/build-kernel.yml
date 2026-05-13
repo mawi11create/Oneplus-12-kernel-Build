@@ -3,14 +3,6 @@ name: Build OnePlus 12 Kernel (KPM + SukiSU Ultra + SUSFS)
 on:
   workflow_dispatch:
     inputs:
-      KERNEL_SOURCE:
-        description: 'Kernel source repo URL'
-        required: true
-        default: 'https://github.com/OnePlusOSS/android_kernel_oneplus_sm8650'
-      KERNEL_BRANCH:
-        description: 'Kernel source branch'
-        required: true
-        default: 'oneplus/sm8650_v_15.0.0_oneplus12'
       SUSFS_ENABLED:
         description: 'Enable SUSFS patch'
         required: true
@@ -39,7 +31,8 @@ jobs:
             python3 python3-pip cpio \
             build-essential libncurses-dev \
             binutils-aarch64-linux-gnu \
-            gcc-aarch64-linux-gnu
+            gcc-aarch64-linux-gnu \
+            pahole
 
       - name: Setup Clang toolchain
         run: |
@@ -48,27 +41,23 @@ jobs:
           sudo ./llvm.sh 17
           echo "CLANG_PATH=/usr/lib/llvm-17/bin" >> $GITHUB_ENV
 
-      - name: Clone kernel source
+      - name: Clone kernel source (CLO SM8650 6.1)
         run: |
           git clone --depth=1 \
-            -b ${{ github.event.inputs.KERNEL_BRANCH }} \
-            ${{ github.event.inputs.KERNEL_SOURCE }} \
+            -b android14-6.1-2024-01 \
+            https://git.codelinaro.org/clo/la/kernel/msm-kernel.git \
             kernel_source
           echo "KERNEL_DIR=$GITHUB_WORKSPACE/kernel_source" >> $GITHUB_ENV
 
-      - name: Inspect kernel build system
+      - name: Inspect kernel source
         run: |
           cd $GITHUB_WORKSPACE/kernel_source
-          echo "=== Root files ==="
-          ls
-          echo "=== arch/arm64/configs ==="
-          ls arch/arm64/configs/
-          echo "=== vendor configs ==="
-          ls vendor/ 2>/dev/null || echo "No vendor dir"
-          echo "=== build.config files ==="
-          find . -maxdepth 2 -name "build.config*" 2>/dev/null | head -20
-          echo "=== Makefile head ==="
+          echo "=== Kernel version ==="
           head -5 Makefile
+          echo "=== arch/arm64/configs ==="
+          ls arch/arm64/configs/ | head -30
+          echo "=== Looking for GKI/kalama configs ==="
+          find arch/arm64/configs -name "*gki*" -o -name "*kalama*" 2>/dev/null
 
       - name: Setup SukiSU Ultra
         run: |
@@ -84,7 +73,11 @@ jobs:
             https://gitlab.com/simonpunk/susfs4ksu.git \
             /tmp/susfs4ksu
           PATCH_DIR="/tmp/susfs4ksu/kernel_patches"
-          if [ -f "$PATCH_DIR/add_sus_fs_6.1.patch" ]; then
+          KVER=$(make kernelversion | cut -d. -f1-2)
+          echo "Kernel version: $KVER"
+          if [ -f "$PATCH_DIR/add_sus_fs_${KVER}.patch" ]; then
+            patch -p1 < "$PATCH_DIR/add_sus_fs_${KVER}.patch" || true
+          elif [ -f "$PATCH_DIR/add_sus_fs_6.1.patch" ]; then
             patch -p1 < "$PATCH_DIR/add_sus_fs_6.1.patch" || true
           fi
           if [ -f "$PATCH_DIR/add_sus_ksu_hooks_v3.patch" ]; then
@@ -106,21 +99,10 @@ jobs:
 
           MAKE_ARGS="ARCH=arm64 O=out CC=clang CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 -j$(nproc --all)"
 
-          # Step 1: Generate base GKI config
+          # Use gki_defconfig as base
           make $MAKE_ARGS gki_defconfig
 
-          # Step 2: Merge vendor fragments on top
-          for cfg in \
-            arch/arm64/configs/vendor/kalama_GKI.config \
-            arch/arm64/configs/vendor/oneplus_GKI.config \
-            arch/arm64/configs/vendor/debugfs.config; do
-            if [ -f "$cfg" ]; then
-              echo "Merging: $cfg"
-              ./scripts/kconfig/merge_config.sh -m -O out out/.config "$cfg"
-            fi
-          done
-
-          # Step 3: Enable KPM and KSU options
+          # Enable KPM + KSU + SUSFS options
           cat >> out/.config << 'EOF'
           CONFIG_KPM=y
           CONFIG_MODULES=y
@@ -135,12 +117,13 @@ jobs:
           CONFIG_KSU_SUSFS_SUS_SU=y
           EOF
 
-          # Step 4: Finalize config
+          # Finalize config
           make $MAKE_ARGS olddefconfig
 
-          # Step 5: Build
+          # Build kernel
           echo "=== Starting kernel build ==="
           make $MAKE_ARGS 2>&1 | tee build.log
+          echo "Build finished with exit: ${PIPESTATUS[0]}"
 
       - name: Package with AnyKernel3
         run: |
