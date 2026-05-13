@@ -43,8 +43,6 @@ jobs:
 
       - name: Setup Clang toolchain
         run: |
-          mkdir -p $HOME/toolchain
-          cd $HOME/toolchain
           wget -q https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
           sudo ./llvm.sh 17
@@ -58,42 +56,19 @@ jobs:
             kernel_source
           echo "KERNEL_DIR=$GITHUB_WORKSPACE/kernel_source" >> $GITHUB_ENV
 
-      - name: Find defconfig
+      - name: Inspect kernel build system
         run: |
           cd $GITHUB_WORKSPACE/kernel_source
-          echo "=== Listing arch/arm64/configs ==="
+          echo "=== Root files ==="
+          ls
+          echo "=== arch/arm64/configs ==="
           ls arch/arm64/configs/
-          echo "=== Listing vendor configs if present ==="
-          ls vendor/ 2>/dev/null || true
-
-          # Try to find the right defconfig
-          DEFCONFIG=""
-          for name in \
-            "vendor/kalama_GKI.config" \
-            "vendor/oneplus_GKI.config" \
-            "gki_defconfig" \
-            "kalama_GKI.config" \
-            "oneplus12_defconfig"; do
-            if [ -f "arch/arm64/configs/$name" ]; then
-              DEFCONFIG="$name"
-              echo "Found defconfig: $name"
-              break
-            fi
-          done
-
-          # Fallback: use first available
-          if [ -z "$DEFCONFIG" ]; then
-            DEFCONFIG=$(ls arch/arm64/configs/ | grep -i "kalama\|oneplus\|gki" | head -1)
-            echo "Using fallback defconfig: $DEFCONFIG"
-          fi
-
-          if [ -z "$DEFCONFIG" ]; then
-            echo "ERROR: No defconfig found!"
-            ls arch/arm64/configs/
-            exit 1
-          fi
-
-          echo "DEFCONFIG=$DEFCONFIG" >> $GITHUB_ENV
+          echo "=== vendor configs ==="
+          ls vendor/ 2>/dev/null || echo "No vendor dir"
+          echo "=== build.config files ==="
+          find . -maxdepth 2 -name "build.config*" 2>/dev/null | head -20
+          echo "=== Makefile head ==="
+          head -5 Makefile
 
       - name: Setup SukiSU Ultra
         run: |
@@ -117,12 +92,36 @@ jobs:
           fi
           echo "SUSFS applied"
 
-      - name: Enable KPM in kernel config
+      - name: Build kernel
         run: |
           cd ${{ env.KERNEL_DIR }}
-          CONFIG_FILE="arch/arm64/configs/${{ env.DEFCONFIG }}"
-          echo "Appending KPM config to: $CONFIG_FILE"
-          cat >> "$CONFIG_FILE" << 'EOF'
+
+          export PATH="/usr/lib/llvm-17/bin:$PATH"
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CC=clang
+          export LLVM=1
+          export LLVM_IAS=1
+
+          MAKE_ARGS="ARCH=arm64 O=out CC=clang CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 -j$(nproc --all)"
+
+          # Step 1: Generate base GKI config
+          make $MAKE_ARGS gki_defconfig
+
+          # Step 2: Merge vendor fragments on top
+          for cfg in \
+            arch/arm64/configs/vendor/kalama_GKI.config \
+            arch/arm64/configs/vendor/oneplus_GKI.config \
+            arch/arm64/configs/vendor/debugfs.config; do
+            if [ -f "$cfg" ]; then
+              echo "Merging: $cfg"
+              ./scripts/kconfig/merge_config.sh -m -O out out/.config "$cfg"
+            fi
+          done
+
+          # Step 3: Enable KPM and KSU options
+          cat >> out/.config << 'EOF'
           CONFIG_KPM=y
           CONFIG_MODULES=y
           CONFIG_MODULE_UNLOAD=y
@@ -136,25 +135,12 @@ jobs:
           CONFIG_KSU_SUSFS_SUS_SU=y
           EOF
 
-      - name: Build kernel
-        run: |
-          cd ${{ env.KERNEL_DIR }}
-          export PATH="/usr/lib/llvm-17/bin:$PATH"
-          export ARCH=arm64
-          export SUBARCH=arm64
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          export CC=clang
-          export LLVM=1
-          export LLVM_IAS=1
+          # Step 4: Finalize config
+          make $MAKE_ARGS olddefconfig
 
-          MAKE_ARGS="O=out ARCH=arm64 CC=clang CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1 -j$(nproc --all)"
-
-          echo "=== Generating .config from ${{ env.DEFCONFIG }} ==="
-          make $MAKE_ARGS ${{ env.DEFCONFIG }}
-
+          # Step 5: Build
           echo "=== Starting kernel build ==="
           make $MAKE_ARGS 2>&1 | tee build.log
-          echo "Build exit code: $?"
 
       - name: Package with AnyKernel3
         run: |
@@ -193,7 +179,7 @@ jobs:
 
           cd AnyKernel3
           zip -r9 "../OnePlus12-SukiSU-KPM-SUSFS-$(date +%Y%m%d).zip" . -x ".git*"
-          echo "Package created successfully"
+          echo "Package created!"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
