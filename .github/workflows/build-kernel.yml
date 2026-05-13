@@ -1,0 +1,232 @@
+name: Build OnePlus 12 Kernel (KPM + SukiSU Ultra + SUSFS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      KERNEL_SOURCE:
+        description: 'Kernel source repo URL'
+        required: true
+        default: 'https://github.com/OnePlusOSS/android_kernel_oneplus_sm8650'
+      KERNEL_BRANCH:
+        description: 'Kernel source branch'
+        required: true
+        default: 'oneplus/sm8650_v_15.0.0_oneplus12'
+      SUSFS_ENABLED:
+        description: 'Enable SUSFS patch'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup build environment
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            git curl wget zip unzip \
+            bc bison flex libssl-dev libelf-dev \
+            python3 python3-pip cpio \
+            build-essential libncurses-dev \
+            binutils-aarch64-linux-gnu \
+            gcc-aarch64-linux-gnu
+
+      - name: Setup Clang toolchain
+        run: |
+          mkdir -p $HOME/toolchain
+          cd $HOME/toolchain
+          # Download LLVM/Clang 17
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 17
+          echo "CLANG_PATH=/usr/lib/llvm-17/bin" >> $GITHUB_ENV
+
+      - name: Clone kernel source
+        run: |
+          git clone --depth=1 \
+            -b ${{ github.event.inputs.KERNEL_BRANCH }} \
+            ${{ github.event.inputs.KERNEL_SOURCE }} \
+            kernel_source
+          echo "KERNEL_DIR=$GITHUB_WORKSPACE/kernel_source" >> $GITHUB_ENV
+
+      - name: Setup SukiSU Ultra (KernelSU)
+        run: |
+          cd ${{ env.KERNEL_DIR }}
+          # Apply SukiSU Ultra
+          curl -LSs "https://raw.githubusercontent.com/ShirkNeko/SukiSU-Ultra/main/kernel/setup.sh" | bash -s susfs-main
+          echo "SukiSU Ultra applied successfully"
+
+      - name: Apply SUSFS patch
+        if: ${{ github.event.inputs.SUSFS_ENABLED == 'true' }}
+        run: |
+          cd ${{ env.KERNEL_DIR }}
+          # Clone SUSFS
+          git clone --depth=1 \
+            https://gitlab.com/simonpunk/susfs4ksu.git \
+            /tmp/susfs4ksu
+
+          KERNEL_VERSION=$(make kernelversion | cut -d. -f1-2)
+          echo "Kernel version: $KERNEL_VERSION"
+
+          # Apply SUSFS patches
+          PATCH_DIR="/tmp/susfs4ksu/kernel_patches"
+
+          # Apply fs patch
+          if [ -f "$PATCH_DIR/add_sus_fs_${KERNEL_VERSION}.patch" ]; then
+            patch -p1 < "$PATCH_DIR/add_sus_fs_${KERNEL_VERSION}.patch" || true
+          elif [ -f "$PATCH_DIR/add_sus_fs_6.1.patch" ]; then
+            patch -p1 < "$PATCH_DIR/add_sus_fs_6.1.patch" || true
+          fi
+
+          # Apply KSU SUSFS patch
+          if [ -f "$PATCH_DIR/add_sus_ksu_hooks_v3.patch" ]; then
+            patch -p1 < "$PATCH_DIR/add_sus_ksu_hooks_v3.patch" || true
+          fi
+
+          echo "SUSFS applied successfully"
+
+      - name: Enable KPM in kernel config
+        run: |
+          cd ${{ env.KERNEL_DIR }}
+          # Find the defconfig for OnePlus 12
+          DEFCONFIG="vendor/kalama_GKI.config"
+          if [ ! -f "arch/arm64/configs/$DEFCONFIG" ]; then
+            DEFCONFIG=$(find arch/arm64/configs -name "*kalama*" -o -name "*oneplus12*" | head -1)
+          fi
+          echo "Using defconfig: $DEFCONFIG"
+          echo "CONFIG_FILE=$DEFCONFIG" >> $GITHUB_ENV
+
+          # Enable KPM and related options
+          cat >> arch/arm64/configs/$DEFCONFIG << 'EOF'
+          # KPM Support
+          CONFIG_KPM=y
+          CONFIG_MODULES=y
+          CONFIG_MODULE_UNLOAD=y
+          CONFIG_MODVERSIONS=y
+          # SukiSU Ultra
+          CONFIG_KSU=y
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y
+          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_SUS_SU=y
+          EOF
+
+      - name: Build kernel
+        run: |
+          cd ${{ env.KERNEL_DIR }}
+
+          export PATH="${{ env.CLANG_PATH }}:$PATH"
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          export CC=clang
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+
+          # Build args
+          MAKE_ARGS="
+            O=out
+            ARCH=arm64
+            CC=clang
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+            LLVM=1
+            LLVM_IAS=1
+            -j$(nproc --all)
+          "
+
+          # Generate config
+          make $MAKE_ARGS ${{ env.CONFIG_FILE }}
+
+          # Build
+          make $MAKE_ARGS 2>&1 | tee build.log
+
+          echo "BUILD_STATUS=success" >> $GITHUB_ENV
+
+      - name: Package with AnyKernel3
+        run: |
+          git clone --depth=1 \
+            https://github.com/osm0sis/AnyKernel3.git \
+            AnyKernel3
+
+          # Copy kernel image
+          KERNEL_IMAGE="${{ env.KERNEL_DIR }}/out/arch/arm64/boot/Image"
+          if [ -f "$KERNEL_IMAGE" ]; then
+            cp "$KERNEL_IMAGE" AnyKernel3/
+          else
+            echo "ERROR: Kernel image not found!"
+            exit 1
+          fi
+
+          # Copy DTBs if present
+          if [ -d "${{ env.KERNEL_DIR }}/out/arch/arm64/boot/dts" ]; then
+            find ${{ env.KERNEL_DIR }}/out/arch/arm64/boot/dts -name "*.dtb" \
+              -exec cp {} AnyKernel3/dtbs/ \; 2>/dev/null || true
+          fi
+
+          # Write anykernel.sh for OnePlus 12
+          cat > AnyKernel3/anykernel.sh << 'EOF'
+          # AnyKernel3 config for OnePlus 12 (CPH2573)
+          properties() { '
+          kernel.string=SukiSU Ultra + KPM + SUSFS | OnePlus 12
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=OnePlus12
+          device.name2=CPH2573
+          device.name3=OP595DL1
+          device.name4=oneplus12
+          supported.versions=16
+          '; }
+
+          block=/dev/block/bootdevice/by-name/boot;
+          is_slot_device=1;
+          ramdisk_compression=auto;
+          patch_vbmeta_flag=auto;
+
+          . tools/ak3-core.sh
+          . split_img
+          . flash_boot
+          EOF
+
+          # Create flashable zip
+          cd AnyKernel3
+          zip -r9 \
+            "../OnePlus12-SukiSU-KPM-SUSFS-$(date +%Y%m%d).zip" \
+            . \
+            -x ".git*" "*.md" "LICENSE"
+
+          echo "ARTIFACT=$(ls ../OnePlus12-SukiSU-KPM-SUSFS-*.zip)" >> $GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OnePlus12-SukiSU-KPM-SUSFS-kernel
+          path: OnePlus12-SukiSU-KPM-SUSFS-*.zip
+          retention-days: 7
+
+      - name: Upload build log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: kernel_source/build.log
+          retention-days: 3
